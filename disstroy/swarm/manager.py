@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Set
 from disstroy.config import DiSSTROYConfig
 from disstroy.evidence.engine import EvidenceEngine
 from disstroy.intelligence.failure import FailureIntelligenceEngine
-from disstroy.models.enums import WorkerState
+from disstroy.models.enums import HypothesisStatus, WorkerState
 from disstroy.models.hypothesis import Hypothesis
 from disstroy.models.worker import WorkerInfo, WorkerResult
 from disstroy.simulator.environment import SimulatedSecurityEnvironment
@@ -70,6 +70,11 @@ class SwarmManager:
 
     def dispatch_hypothesis(self, hypothesis: Hypothesis) -> Optional[asyncio.Task]:
         """Assign hypothesis to an available worker and launch background task."""
+        # Enforce prerequisite eligibility gate: never dispatch blocked or pending hypotheses
+        if hypothesis.status == HypothesisStatus.PENDING or hypothesis.metadata.get("is_blocked"):
+            logger.info("Hypothesis %s is PENDING or blocked by unmet prerequisites; skipping dispatch.", hypothesis.id)
+            return None
+
         if not self.has_available_capacity():
             return None
 

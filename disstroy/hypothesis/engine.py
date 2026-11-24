@@ -3,6 +3,7 @@
 import logging
 from typing import List, Optional
 from disstroy.hypothesis.prioritizer import DynamicHypothesisPrioritizer
+from disstroy.hypothesis.resolver import HypothesisDependencyResolver
 from disstroy.llm.base import BaseLLMProvider
 from disstroy.models.enums import HypothesisStatus
 from disstroy.models.hypothesis import Hypothesis
@@ -19,10 +20,12 @@ class HypothesisEngine:
         shared_state: SharedState,
         llm_provider: BaseLLMProvider,
         prioritizer: DynamicHypothesisPrioritizer,
+        dependency_resolver: Optional[HypothesisDependencyResolver] = None,
     ):
         self.state = shared_state
         self.llm = llm_provider
         self.prioritizer = prioritizer
+        self.resolver = dependency_resolver or HypothesisDependencyResolver(shared_state, prioritizer=prioritizer)
 
     async def generate_hypotheses_for_asset(self, asset_id: str) -> List[Hypothesis]:
         """Synthesize competing hypotheses for a specific asset using observations and failure lessons."""
@@ -36,10 +39,11 @@ class HypothesisEngine:
 
         generated = await self.llm.generate_hypotheses(asset, observations, active_lessons)
 
-        # Prioritize and save
+        # Prioritize, resolve dependency gates, and save
         stored_hypotheses: List[Hypothesis] = []
         for hyp in generated:
             hyp.priority_score = await self.prioritizer.calculate_priority(hyp, asset)
+            await self.resolver.update_hypothesis_dependency_state(hyp)
             await self.state.add_hypothesis(hyp)
             stored_hypotheses.append(hyp)
 
