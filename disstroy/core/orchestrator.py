@@ -9,8 +9,10 @@ from disstroy.config import DiSSTROYConfig
 from disstroy.discovery.engine import DiscoveryEngine
 from disstroy.evidence.engine import EvidenceEngine
 from disstroy.graph.knowledge_graph import KnowledgeGraph
+from disstroy.graph.path_evaluator import AttackPathEvaluator
 from disstroy.hypothesis.engine import HypothesisEngine
 from disstroy.hypothesis.prioritizer import DynamicHypothesisPrioritizer
+from disstroy.hypothesis.resolver import HypothesisDependencyResolver
 from disstroy.intelligence.failure import FailureIntelligenceEngine
 from disstroy.llm.base import BaseLLMProvider
 from disstroy.llm.mock import MockLLMProvider
@@ -82,7 +84,13 @@ class DiSSTROYOrchestrator:
         self.prioritizer = DynamicHypothesisPrioritizer(
             self.state, self.failure_intelligence, self.config
         )
-        self.hypothesis_engine = HypothesisEngine(self.state, self.llm_provider, self.prioritizer)
+        self.path_evaluator = AttackPathEvaluator(self.graph, self.state)
+        self.dependency_resolver = HypothesisDependencyResolver(
+            self.state, self.graph, self.prioritizer, self.path_evaluator
+        )
+        self.hypothesis_engine = HypothesisEngine(
+            self.state, self.llm_provider, self.prioritizer, self.dependency_resolver
+        )
         self.discovery_engine = DiscoveryEngine(self.state)
         self.swarm_manager = SwarmManager(
             shared_state=self.state,
@@ -90,6 +98,8 @@ class DiSSTROYOrchestrator:
             failure_intelligence=self.failure_intelligence,
             simulator=self.simulator,
             config=self.config,
+            dependency_resolver=self.dependency_resolver,
+            path_evaluator=self.path_evaluator,
         )
 
         self.current_state = OrchestratorState.DISCOVERING
@@ -115,6 +125,10 @@ class DiSSTROYOrchestrator:
         self.graph.add_asset_dependency("asset_api_gw", "asset_admin_portal", "INTERNAL_ROUTE")
         self.graph.add_asset_dependency("asset_auth_svc", "asset_db_cluster", "QUERIES_CREDENTIALS")
 
+        # Discover initial candidate attack paths
+        if self.path_evaluator:
+            await self.path_evaluator.discover_candidate_paths()
+
         # ---------------- 2. INITIAL OBSERVATIONS ----------------
         await self.discovery_engine.ingest_initial_observations(self.simulator.initial_observations)
 
@@ -130,18 +144,8 @@ class DiSSTROYOrchestrator:
         while iteration < self.config.orchestrator_max_iterations:
             iteration += 1
 
-            # Fetch open (proposed / queued) hypotheses
-            open_hyps = await self.state.list_hypotheses(status=HypothesisStatus.PROPOSED)
-            open_hyps.sort(key=lambda h: h.priority_score, reverse=True)
-
-            # Dispatch available hypotheses to idle workers
-            for hyp in open_hyps:
-                if self.swarm_manager.has_available_capacity():
-                    hyp.status = HypothesisStatus.QUEUED
-                    await self.state.update_hypothesis(hyp)
-                    self.swarm_manager.dispatch_hypothesis(hyp)
-                else:
-                    break
+            # Dispatch available hypotheses to idle workers via dynamic dependency-aware scheduling
+            await self.swarm_manager.schedule_cycle()
 
             # If no workers active and no open hypotheses, check dynamic events or converge
             if self.swarm_manager.active_worker_count == 0:
@@ -157,8 +161,9 @@ class DiSSTROYOrchestrator:
             # Await worker completions
             completed_results = await self.swarm_manager.wait_for_any_completed(timeout=5.0)
 
-            # ---------------- 5. FAILURE ANALYSIS & REPRIORITIZATION ----------------
+            # ---------------- 5. DEPENDENCY RESOLUTION & ADAPTIVE REPRIORITIZATION ----------------
             if completed_results:
+                await self.swarm_manager.process_completed_investigations(completed_results)
                 had_failures = any(not r.success or r.failure_record for r in completed_results)
                 if had_failures:
                     # Dynamically reprioritize remaining hypotheses in light of failure lessons

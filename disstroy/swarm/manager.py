@@ -5,8 +5,10 @@ import logging
 from typing import Dict, List, Optional, Set
 from disstroy.config import DiSSTROYConfig
 from disstroy.evidence.engine import EvidenceEngine
+from disstroy.graph.path_evaluator import AttackPathEvaluator
+from disstroy.hypothesis.resolver import HypothesisDependencyResolver
 from disstroy.intelligence.failure import FailureIntelligenceEngine
-from disstroy.models.enums import HypothesisStatus, WorkerState
+from disstroy.models.enums import HypothesisStatus, PathStatus, WorkerState
 from disstroy.models.hypothesis import Hypothesis
 from disstroy.models.worker import WorkerInfo, WorkerResult
 from disstroy.simulator.environment import SimulatedSecurityEnvironment
@@ -26,8 +28,16 @@ class SwarmManager:
         failure_intelligence: FailureIntelligenceEngine,
         simulator: SimulatedSecurityEnvironment,
         config: DiSSTROYConfig,
+        dependency_resolver: Optional[HypothesisDependencyResolver] = None,
+        path_evaluator: Optional[AttackPathEvaluator] = None,
     ):
         self.state = shared_state
+        self.evidence_engine = evidence_engine
+        self.failure_intel = failure_intelligence
+        self.simulator = simulator
+        self.max_workers = config.max_concurrent_workers
+        self.dependency_resolver = dependency_resolver or HypothesisDependencyResolver(self.state)
+        self.path_evaluator = path_evaluator
         self.evidence_engine = evidence_engine
         self.failure_intel = failure_intelligence
         self.simulator = simulator
@@ -75,6 +85,11 @@ class SwarmManager:
             logger.info("Hypothesis %s is PENDING or blocked by unmet prerequisites; skipping dispatch.", hypothesis.id)
             return None
 
+        # Prevent duplicate concurrent dispatch
+        if hypothesis.id in self.active_tasks:
+            logger.info("Hypothesis %s is already actively executing; duplicate dispatch prevented.", hypothesis.id)
+            return None
+
         if not self.has_available_capacity():
             return None
 
@@ -90,6 +105,101 @@ class SwarmManager:
         self.total_dispatched += 1
         self.peak_simultaneous_workers = max(self.peak_simultaneous_workers, len(self.active_tasks))
         return task
+
+    async def evaluate_scheduling_candidates(self) -> List[Hypothesis]:
+        """
+        Evaluate and rank all hypotheses for scheduling eligibility.
+        Considers status, dependency eligibility, blocked state, priority, path relevance,
+        expected information gain, and prevents duplicate active dispatches.
+        """
+        all_hyps = await self.state.list_hypotheses()
+        active_ids = set(self.active_tasks.keys())
+
+        # Exclude terminal and already running hypotheses
+        open_candidates = [
+            h for h in all_hyps
+            if h.status not in (HypothesisStatus.VALIDATED, HypothesisStatus.REFUTED, HypothesisStatus.ABANDONED)
+            and h.id not in active_ids
+        ]
+
+        eligible_candidates: List[Hypothesis] = []
+        for hyp in open_candidates:
+            # 1. Dependency and prerequisite evaluation
+            if self.dependency_resolver:
+                resolution = await self.dependency_resolver.resolve_dependencies(hyp)
+                if resolution.is_blocked:
+                    if hyp.status != HypothesisStatus.PENDING:
+                        hyp.status = HypothesisStatus.PENDING
+                        hyp.metadata["is_blocked"] = True
+                        hyp.metadata["blocking_reason"] = resolution.blocking_reason
+                        await self.state.update_hypothesis(hyp)
+                    continue
+                else:
+                    if hyp.status == HypothesisStatus.PENDING:
+                        hyp.status = HypothesisStatus.PROPOSED
+                        hyp.metadata["is_blocked"] = False
+                        hyp.metadata.pop("blocking_reason", None)
+                        await self.state.update_hypothesis(hyp)
+
+            # 2. Path relevance bonus (e.g. canary target or active attack path)
+            relevance_boost = 0.0
+            if self.path_evaluator:
+                paths = await self.state.list_attack_paths()
+                for p in paths:
+                    if hyp.id in p.hypothesis_sequence:
+                        if p.canary_target:
+                            relevance_boost = max(relevance_boost, 0.15)
+                        elif p.path_status in (PathStatus.FEASIBLE, PathStatus.THEORETICAL):
+                            relevance_boost = max(relevance_boost, 0.08)
+
+            # 3. Information gain bonus from supporting observation density
+            info_gain = min(0.05, len(hyp.supporting_observation_ids) * 0.02)
+
+            effective_score = round(min(1.0, hyp.priority_score + relevance_boost + info_gain), 4)
+            hyp.metadata["scheduling_score"] = effective_score
+            eligible_candidates.append(hyp)
+
+        # Sort descending by effective scheduling score, fallback to priority_score
+        eligible_candidates.sort(
+            key=lambda h: (h.metadata.get("scheduling_score", h.priority_score), h.priority_score),
+            reverse=True,
+        )
+        return eligible_candidates
+
+    async def schedule_cycle(self) -> List[asyncio.Task]:
+        """
+        Run an autonomous scheduling cycle:
+        Evaluates candidate hypotheses, enforces dependency eligibility, and dispatches to idle workers.
+        """
+        if not self.has_available_capacity():
+            return []
+
+        candidates = await self.evaluate_scheduling_candidates()
+        dispatched_tasks: List[asyncio.Task] = []
+
+        for hyp in candidates:
+            if not self.has_available_capacity():
+                break
+            hyp.status = HypothesisStatus.QUEUED
+            await self.state.update_hypothesis(hyp)
+            task = self.dispatch_hypothesis(hyp)
+            if task:
+                dispatched_tasks.append(task)
+
+        return dispatched_tasks
+
+    async def process_completed_investigations(self, completed_results: List[WorkerResult]) -> None:
+        """Process completed investigation results: unlock dependent hypotheses on validation, block on refutation."""
+        for r in completed_results:
+            hyp = await self.state.get_hypothesis(r.hypothesis_id)
+            if not hyp:
+                continue
+            if hyp.status == HypothesisStatus.VALIDATED:
+                if self.dependency_resolver:
+                    await self.dependency_resolver.evaluate_and_unlock_dependent_hypotheses(hyp.id)
+            elif hyp.status in (HypothesisStatus.REFUTED, HypothesisStatus.ABANDONED):
+                if self.dependency_resolver:
+                    await self.dependency_resolver.evaluate_and_block_dependent_hypotheses(hyp.id)
 
     def stop_investigation(self, hypothesis_id: str) -> bool:
         """Request immediate cessation of a running investigation due to superseding evidence."""
